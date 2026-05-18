@@ -13,7 +13,7 @@ setup(
     long_description=README,
     long_description_content_type="text/markdown",
     license="LGPL-3.0-or-later",
-    url="https://github.com/trailofbits/cvedb",
+    url="https://github.com/kernelzeroday/cvedb",
     author="Trail of Bits",
     version="0.0.5",
     packages=find_packages(exclude=["test"]),

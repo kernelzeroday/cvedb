@@ -41,7 +41,7 @@ class BeforeQuery(AbstractDateQuery, ABC):
         super().__init__(date_before)
 
     def matches(self, cve: CVE) -> bool:
-        return self.get_field(cve).date() <= self.date
+        return self.get_field(cve).date() <= self.date.date()
 
 
 class AfterQuery(AbstractDateQuery, ABC):

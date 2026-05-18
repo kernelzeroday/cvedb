@@ -1,15 +1,19 @@
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from gzip import decompress
 import itertools
 import json
+import os
 from pathlib import Path
-import pkg_resources
+from importlib.metadata import version as _version
 import sys
+import time
 from typing import Any, Dict, Iterable, Iterator, List, Optional, TextIO, Union
+import urllib.error
 import urllib.request
+from urllib.parse import urlencode
 
-from cvss import CVSS2, CVSS3
+from cvss import CVSS2, CVSS3, CVSSError
 from dateutil.parser import isoparse
 from tqdm import tqdm
 
@@ -179,7 +183,7 @@ class JsonDataSource(DataSource):
 
 
 def download(url: str, size: Optional[int] = None, show_progress: bool = True) -> bytes:
-    cvedb_version = pkg_resources.require("cvedb")[0].version
+    cvedb_version = _version("cvedb")
     request = urllib.request.Request(
         url=url,
         data=None,
@@ -188,7 +192,7 @@ def download(url: str, size: Optional[int] = None, show_progress: bool = True) -
                 f"Mozilla/5.0 ({sys.platform}) AppleWebKit/605.1.15 (KHTML, like Gecko) CVEdb/{cvedb_version}"
         }
     )
-    with urllib.request.urlopen(request) as req:
+    with urllib.request.urlopen(request, timeout=120) as req:
         if not show_progress:
             return req.read()
         ret = bytearray()
@@ -215,23 +219,230 @@ class JsonFeed(Feed):
         self.cached_json_path: Path = PRE_SEED_DATA_DIR / f"nvdcve-1.1-{self.name}.json.gz"
 
     def reload(self, existing_data: Optional[Data] = None) -> DataSource:
-        if existing_data is None or len(existing_data) == 0:
-            # This is our first time loading this feed, so use the version shipped with CVEdb, if it exists:
-            if self.cached_json_path.exists() and self.cached_meta_path.exists():
-                with open(self.cached_meta_path, "r") as meta:
-                    with open(self.cached_json_path, "rb") as compressed_json:
-                        return JsonDataSource.load(json.loads(decompress(compressed_json.read())), Meta.load(meta))
-        with urllib.request.urlopen(self.meta_url) as req:
-            new_meta = Meta.load(req)
-        if existing_data is not None and existing_data.last_modified_date is not None and \
-                new_meta.last_modified_date <= existing_data.last_modified_date:
-            # the existing data is newer
+        # Try to fetch updated data from NVD feeds
+        try:
+            with urllib.request.urlopen(self.meta_url, timeout=30) as req:
+                new_meta = Meta.load(req)
+            if existing_data is not None and existing_data.last_modified_date is not None and \
+                    new_meta.last_modified_date <= existing_data.last_modified_date:
+                return existing_data
+            compressed = download(self.gz_url, new_meta.gz_size, sys.stderr.isatty())
+            decompressed = decompress(compressed)
+            data = json.loads(decompressed)
+            return JsonDataSource.load(data, new_meta)
+        except (urllib.error.HTTPError, urllib.error.URLError, OSError):
+            pass
+        # NVD feeds unavailable; fall back to shipped seed data or existing data
+        if existing_data is not None and len(existing_data) > 0:
             return existing_data
-        compressed = download(self.gz_url, new_meta.gz_size, sys.stderr.isatty())
-        decompressed = decompress(compressed)
-        data = json.loads(decompressed)
-        return JsonDataSource.load(data, new_meta)
+        if self.cached_json_path.exists() and self.cached_meta_path.exists():
+            with open(self.cached_meta_path, "r") as meta:
+                with open(self.cached_json_path, "rb") as compressed_json:
+                    return JsonDataSource.load(json.loads(decompress(compressed_json.read())), Meta.load(meta))
+        # No data available at all — return empty
+        return JsonDataSource.load(
+            {"CVE_data_type": "CVE", "CVE_data_format": "MITRE", "CVE_data_version": "4.0",
+             "CVE_data_timestamp": datetime.fromtimestamp(0).isoformat(), "CVE_Items": []}
+        )
 
 
 for year in range(2002, datetime.now().year + 1):
     JsonFeed(str(year))
+
+
+class RateLimiter:
+    def __init__(self):
+        self.api_key = os.environ.get("NVD_API_KEY")
+        self.max_requests = 50 if self.api_key else 5
+        self.window_seconds = 30
+        self.request_times = []
+
+    def wait(self):
+        now = time.time()
+        self.request_times = [t for t in self.request_times
+                              if now - t < self.window_seconds]
+        if len(self.request_times) >= self.max_requests:
+            sleep_time = self.window_seconds - (now - self.request_times[0])
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+        self.request_times.append(time.time())
+
+
+class ApiDataSource(DataSource):
+    def __init__(self, last_modified_date: datetime, cves: Iterable[CVE]):
+        super().__init__(last_modified_date)
+        self.cves: List[CVE] = list(cves)
+
+    def __iter__(self) -> Iterator[CVE]:
+        return iter(self.cves)
+
+    def __len__(self) -> int:
+        return len(self.cves)
+
+    @staticmethod
+    def parse_cve_api(cve_obj: Dict[str, Any]) -> CVE:
+        cve_id = cve_obj["id"]
+        assigner = cve_obj.get("sourceIdentifier")
+
+        descriptions = tuple(
+            Description(lang=desc["lang"], value=desc["value"])
+            for desc in cve_obj.get("descriptions", [])
+        )
+
+        references = tuple(
+            Reference(url=ref.get("url"), name=ref.get("source"))
+            for ref in cve_obj.get("references", [])
+        )
+
+        published_date = isoparse(cve_obj["published"])
+        last_modified_date = isoparse(cve_obj["lastModified"])
+
+        impact = None
+        metrics = cve_obj.get("metrics", {})
+        for metric_key in ("cvssMetricV31", "cvssMetricV30"):
+            if metric_key in metrics and metrics[metric_key]:
+                try:
+                    impact = CVSS3(metrics[metric_key][0]["cvssData"]["vectorString"])
+                    break
+                except (CVSSError, KeyError):
+                    pass
+        if impact is None and "cvssMetricV2" in metrics and metrics["cvssMetricV2"]:
+            try:
+                impact = CVSS2(metrics["cvssMetricV2"][0]["cvssData"]["vectorString"])
+            except (CVSSError, KeyError):
+                pass
+
+        configurations = Configurations(())
+        config_list = cve_obj.get("configurations", [])
+        if config_list:
+            all_nodes = []
+            for config in config_list:
+                all_nodes.extend(config.get("nodes", []))
+            if all_nodes:
+                configurations = JsonDataSource.parse_configurations(
+                    {"nodes": all_nodes, "CVE_data_version": "4.0"}
+                )
+
+        return CVE(
+            cve_id=cve_id,
+            published_date=published_date,
+            last_modified_date=last_modified_date,
+            impact=impact,
+            descriptions=descriptions,
+            references=references,
+            assigner=assigner,
+            configurations=configurations,
+        )
+
+
+class ApiFeed(Feed):
+    API_BASE = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+
+    def __init__(self, name: str, fallback_feeds: Optional[List[Feed]] = None):
+        super().__init__(name)
+        self.fallback_feeds: List[Feed] = fallback_feeds or []
+        self.rate_limiter = RateLimiter()
+
+    def _fetch(self, url: str) -> bytes:
+        self.rate_limiter.wait()
+        cvedb_version = _version("cvedb")
+        request = urllib.request.Request(
+            url=url,
+            headers={
+                "User-Agent":
+                    f"Mozilla/5.0 ({sys.platform}) AppleWebKit/605.1.15 (KHTML, like Gecko) CVEdb/{cvedb_version}"
+            }
+        )
+        with urllib.request.urlopen(request, timeout=120) as resp:
+            return resp.read()
+
+    def _build_url(self, last_mod_start: Optional[datetime],
+                   start_index: int = 0, results_per_page: int = 2000) -> str:
+        params = {
+            "startIndex": str(start_index),
+            "resultsPerPage": str(results_per_page),
+        }
+        if last_mod_start is not None:
+            params["lastModStartDate"] = last_mod_start.astimezone(timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%S.000")
+            params["lastModEndDate"] = datetime.now(timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%S.000")
+        if self.rate_limiter.api_key:
+            params["apiKey"] = self.rate_limiter.api_key
+        return f"{self.API_BASE}?{urlencode(params)}"
+
+    def reload(self, existing_data: Optional[Data] = None) -> DataSource:
+        try:
+            if existing_data is not None and existing_data.last_modified_date is not None:
+                last_mod = existing_data.last_modified_date
+            else:
+                last_mod = None
+
+            all_cves = []
+            start_index = 0
+            total_results = None
+            pbar = None
+
+            while total_results is None or start_index < total_results:
+                url = self._build_url(last_mod, start_index)
+                response = self._fetch(url)
+                data = json.loads(response)
+
+                if total_results is None:
+                    total_results = data.get("totalResults", 0)
+                    if total_results == 0:
+                        break
+                    if sys.stderr.isatty():
+                        pbar = tqdm(total=total_results, desc="fetching CVEs",
+                                    unit=" CVEs", leave=False)
+
+                for vuln in data.get("vulnerabilities", []):
+                    cve_obj = vuln.get("cve", {})
+                    if cve_obj:
+                        all_cves.append(ApiDataSource.parse_cve_api(cve_obj))
+
+                fetched = len(data.get("vulnerabilities", []))
+                if pbar:
+                    pbar.update(fetched)
+                start_index += data.get("resultsPerPage", 2000)
+
+            if pbar:
+                pbar.close()
+
+            if all_cves:
+                max_date = max(cve.last_modified_date for cve in all_cves)
+                return ApiDataSource(max_date, all_cves)
+            if existing_data is not None and len(existing_data) > 0:
+                return existing_data
+            return ApiDataSource(datetime.fromtimestamp(0, timezone.utc), [])
+        except Exception:
+            pass
+
+        # Fall back to existing data or seed data from yearly feeds
+        if existing_data is not None and len(existing_data) > 0:
+            return existing_data
+        all_cves = []
+        max_date = None
+        for feed in self.fallback_feeds:
+            try:
+                source = feed.reload(None)
+                if len(source) > 0:
+                    all_cves.extend(source)
+                    cve_max = max(cve.last_modified_date for cve in source)
+                    if max_date is None or cve_max > max_date:
+                        max_date = cve_max
+            except Exception:
+                pass
+        if all_cves:
+            return ApiDataSource(max_date or datetime.now(timezone.utc), all_cves)
+        return ApiDataSource(datetime.fromtimestamp(0, timezone.utc), [])
+
+
+# Keep yearly JsonFeed instances as unregistered fallbacks for seed data
+JsonFeed.register = False
+_FALLBACK_FEEDS: List[Feed] = []
+for year in range(2002, datetime.now().year + 1):
+    _FALLBACK_FEEDS.append(JsonFeed(str(year)))
+
+# Register the API feed as the primary data source
+ApiFeed("nvd-api", fallback_feeds=_FALLBACK_FEEDS)

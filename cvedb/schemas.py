@@ -240,29 +240,25 @@ class SchemaV0(Schema):
         else:
             impact_vector = cve.impact.vector
             base_score = float(cve.impact.base_score)
-        with self.connection as c:
-            col_names = []
-            col_values = []
-            for name, value in extra_cols.items():
-                col_names.append(name)
-                col_values.append(value)
-            extra_col_names = "".join(f", {col}" for col in col_names)
-            c.execute(
-                "INSERT OR REPLACE INTO cves "
-                f"(id, feed, published, last_modified, impact_vector, base_score, severity{extra_col_names}) "
-                f"VALUES (?, ?, ?, ?, ?, ?, ?{', ?' * len(extra_cols)})", [
-                    cve.cve_id, source_feed, cve.published_date.astimezone().timestamp(),
-                    cve.last_modified_date.astimezone().timestamp(), impact_vector, base_score, int(cve.severity)
-                ] + col_values
+        col_names = []
+        col_values = []
+        for name, value in extra_cols.items():
+            col_names.append(name)
+            col_values.append(value)
+        extra_col_names = "".join(f", {col}" for col in col_names)
+        self.connection.execute(
+            "INSERT OR REPLACE INTO cves "
+            f"(id, feed, published, last_modified, impact_vector, base_score, severity{extra_col_names}) "
+            f"VALUES (?, ?, ?, ?, ?, ?, ?{', ?' * len(extra_cols)})", [
+                cve.cve_id, source_feed, cve.published_date.astimezone().timestamp(),
+                cve.last_modified_date.astimezone().timestamp(), impact_vector, base_score, int(cve.severity)
+            ] + col_values
+        )
+        if cve.descriptions:
+            self.connection.executemany(
+                "INSERT OR REPLACE INTO descriptions (cve, lang, description) VALUES (?, ?, ?)",
+                [(cve.cve_id, d.lang, d.value) for d in cve.descriptions]
             )
-            for description in cve.descriptions:
-                c.execute(
-                    "INSERT OR REPLACE INTO descriptions "
-                    "(cve, lang, description) "
-                    "VALUES (?, ?, ?)", (
-                        cve.cve_id, description.lang, description.value
-                    )
-                )
 
     def cve_iter(
             self,
@@ -447,35 +443,31 @@ class SchemaV1(SchemaV0):
         if "configurations" not in extra_cols:
             extra_cols["configurations"] = cve.configurations.dumps()
         super().add(cve, source_feed, **extra_cols)
-        for ref in cve.references:
-            self.connection.execute(
-                "INSERT OR REPLACE INTO refs "
-                "(cve, name, url) "
-                "VALUES (?, ?, ?)", (
-                    cve.cve_id, ref.name, ref.url
-                )
+        if cve.references:
+            self.connection.executemany(
+                "INSERT OR REPLACE INTO refs (cve, name, url) VALUES (?, ?, ?)",
+                [(cve.cve_id, ref.name, ref.url) for ref in cve.references]
             )
         c = self.connection.cursor()
         cols = ("part", "vendor", "product", "version", "update_str", "edition", "language", "sw_edition", "target_sw",
                 "other")
         col_names = ", ".join(cols)
+        where_clause = " AND ".join(f"{col} = ?" for col in cols)
         for cpe in cve.configurations.vulnerable_cpes():
-            c.execute(
-                "INSERT OR IGNORE INTO cpes ("
-                f"{col_names}"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ",
-                [str(c) for c in
-                    (cpe.part.value, cpe.vendor, cpe.product, cpe.version, cpe.update, cpe.edition, cpe.lang,
-                     cpe.sw_edition, cpe.target_sw, cpe.other)]
-            )
-            if c.lastrowid is None:
-                # the CPE already existed
-                args = " AND ".join(f"{col} = ?" for col in cols)
-                c.execute(f"SELECT rowid FROM cpes WHERE {args}", (cpe.part.value, cpe.vendor, cpe.product, cpe.version,
-                                                                   cpe.update, cpe.edition, cpe.lang,
-                                                                   cpe.sw_edition, cpe.target_sw, cpe.other))
-                cpe_row = c.fetchone()[0]
+            values = [str(x) for x in
+                      (cpe.part.value, cpe.vendor, cpe.product, cpe.version, cpe.update, cpe.edition, cpe.lang,
+                       cpe.sw_edition, cpe.target_sw, cpe.other)]
+            c.execute(f"SELECT rowid FROM cpes WHERE {where_clause}", values)
+            row = c.fetchone()
+            if row is not None:
+                cpe_row = row[0]
             else:
+                c.execute(
+                    "INSERT INTO cpes ("
+                    f"{col_names}"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ",
+                    values
+                )
                 cpe_row = c.lastrowid
             c.execute("INSERT OR REPLACE INTO configurations (cpe, cve) VALUES (?, ?)", (cpe_row, cve.cve_id))
 

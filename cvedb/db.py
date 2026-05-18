@@ -93,6 +93,18 @@ class DbBackedFeed(Feed):
                 t.total = len(new_data)
             with self.connection as c:
                 if existing_modified_time is None or new_data.last_modified_date != existing_modified_time:
+                    # Create index for CPE lookups if it doesn't exist
+                    c.execute("CREATE INDEX IF NOT EXISTS idx_cpes_all ON cpes("
+                              "part, vendor, product, version, update_str, edition, "
+                              "language, sw_edition, target_sw, other)")
+                    # Delete old data for this feed before inserting fresh data
+                    c.execute("DELETE FROM configurations WHERE cve IN "
+                              "(SELECT id FROM cves WHERE feed = ?)", (self.feed_id,))
+                    c.execute("DELETE FROM refs WHERE cve IN "
+                              "(SELECT id FROM cves WHERE feed = ?)", (self.feed_id,))
+                    c.execute("DELETE FROM descriptions WHERE cve IN "
+                              "(SELECT id FROM cves WHERE feed = ?)", (self.feed_id,))
+                    c.execute("DELETE FROM cves WHERE feed = ?", (self.feed_id,))
                     for cve in new_data:
                         self.schema.add(cve, self.feed_id)
                         t.update(1)
@@ -220,6 +232,8 @@ class CVEdb(Feed):
         return CVEdbData(self)
 
     def reload(self, existing_data: Optional[Data] = None, force: bool = False) -> CVEdbDataSource:
+        for feed in self.feeds:
+            feed.reload(None, force=force)
         return CVEdbDataSource(self)
 
     @staticmethod
