@@ -1,7 +1,8 @@
 use chrono::{DateTime, Utc};
+use serde::Serialize;
 use std::fmt;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub enum Severity {
     None = 0,
     Unknown = 1,
@@ -50,13 +51,13 @@ impl Severity {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Reference {
     pub url: Option<String>,
     pub name: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Description {
     pub lang: String,
     pub value: String,
@@ -64,7 +65,7 @@ pub struct Description {
 
 pub type Configurations = Vec<ConfigurationNode>;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub enum ConfigurationNode {
     Cpe(CPE),
     And { children: Vec<ConfigurationNode>, negate: bool },
@@ -116,7 +117,7 @@ impl fmt::Display for Part {
 #[allow(dead_code)]
 pub type AVString = Option<String>; // None = wildcard/ANY, Some("-") = NA
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct CPE {
     pub part: Option<String>,
     pub vendor: Option<String>,
@@ -418,7 +419,7 @@ fn field(parts: &[&str], i: usize) -> Option<String> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct CVE {
     pub cve_id: String,
     #[allow(dead_code)]

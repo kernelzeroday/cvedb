@@ -54,6 +54,10 @@ struct Cli {
     #[arg(long = "software-version")]
     software_version: Option<String>,
 
+    /// output full results as JSON
+    #[arg(long)]
+    json: bool,
+
     /// force ANSI colored output
     #[arg(long)]
     ansi: bool,
@@ -294,8 +298,12 @@ fn main() {
     };
 
     // Print
-    let force_color = cli.ansi || std::env::var("FORCE_COLOR").is_ok();
-    printing::print_cves_colored(&filtered, force_color);
+    if cli.json {
+        println!("{}", serde_json::to_string_pretty(&filtered).unwrap());
+    } else {
+        let force_color = cli.ansi || std::env::var("FORCE_COLOR").is_ok();
+        printing::print_cves_colored(&filtered, force_color);
+    }
 }
 
 fn update_database(db_path: &PathBuf) -> Result<usize, String> {
